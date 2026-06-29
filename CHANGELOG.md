@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.0
+
+- Added WHMCS `tblcurrencies` based invoice currency to USD/USDT conversion.
+- Added fail-closed handling for missing USD currency, invalid rates, invoice status changes, and invoice amount changes.
+- Added payment request snapshots for invoice currency, invoice amount, WHMCS rates, computed USDT amount, displayed USDT amount, slot, expiry, txid, and status.
+- Added transaction/request claim flow before `addInvoicePayment()` to avoid duplicate credits from repeated or concurrent callbacks.
+- Added English and Chinese client-area payment instructions.
+- Added repeatable Node scenario tests and PHP lint script.
+
 ## v0.1.0
 
 - Initial WHMCS gateway module for USDT TRC20 single-address payments.

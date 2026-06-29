@@ -1,6 +1,6 @@
 # Callback Payload
 
-OWP-PGW-U expects the blockchain watcher to call the WHMCS callback endpoint after it detects an incoming USDT TRC20 transfer to the configured receiving address.
+OWP-PGW-U expects a separate blockchain watcher service to call the WHMCS callback endpoint after it detects an incoming USDT TRC20 transfer to the configured receiving address.
 
 ```text
 POST https://example.com/modules/gateways/callback/owppgwu.php
@@ -62,9 +62,26 @@ The callback also accepts these aliases:
 | `202` | `conflict` | More than one active invoice has this exact amount. |
 | `202` | `wrong_address` | The receiver address does not match the configured address. |
 | `202` | `wrong_contract` | The contract is not the configured USDT TRC20 contract. |
+| `202` | `invoice_not_payable` | The invoice is no longer `Unpaid` or cannot be auto-credited. |
+| `202` | `invoice_amount_changed` | The invoice currency or balance no longer matches the payment request snapshot. |
+| `202` | `request_already_claimed` | Another callback already claimed the pending request. |
+| `202` | `duplicate_processing` | The same txid is already being processed. |
+| `202` | `duplicate_whmcs_transaction` | WHMCS already has this transaction id. |
 | `400` | `invalid_json`, `invalid_txid`, `invalid_amount` | The payload is malformed. |
 | `403` | `signature_failed` | The HMAC signature is missing or invalid. |
 | `503` | `gateway_not_active`, `webhook_secret_missing` | WHMCS module is not ready. |
+
+Successful callbacks credit the WHMCS invoice balance in the original invoice currency. They do not credit the paid USDT amount directly.
+
+## Watcher responsibilities
+
+The watcher service must:
+
+- Scan TRON for real USDT TRC20 `Transfer` events.
+- Confirm the token contract before calling WHMCS.
+- Send the human USDT amount with up to 6 decimals.
+- Retry callbacks after the configured confirmation threshold is reached.
+- Never include private keys, exchange secrets, or production API credentials in callback payloads.
 
 ## Example signer
 

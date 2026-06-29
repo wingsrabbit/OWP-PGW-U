@@ -74,24 +74,36 @@ function owppgwu_config()
 
 function owppgwu_link($params)
 {
+    $language = owppgwu_language($params);
+
     try {
         owppgwu_ensure_schema();
-        $payment = owppgwu_get_or_create_payment_request($params['invoiceid'], $params['amount'], $params);
+        $payment = owppgwu_get_or_create_payment_request((int) $params['invoiceid'], $params);
     } catch (Exception $exception) {
-        return '<div class="alert alert-danger">USDT TRC20 支付暂不可用：'
-            . owppgwu_html_escape($exception->getMessage())
+        return '<div class="alert alert-danger">'
+            . owppgwu_html_escape(owppgwu_t($language, 'payment_unavailable', [
+                'reason' => owppgwu_error_message($language, $exception->getMessage()),
+            ]))
             . '</div>';
     }
 
     if (!$payment) {
         return '<div class="alert alert-warning">'
-            . '当前 30 分钟内相同基础金额的付款槽位已满，请稍后刷新账单页面重新获取金额。'
+            . owppgwu_html_escape(owppgwu_t($language, 'slots_full'))
             . '</div>';
     }
 
-    $amount = owppgwu_micro_to_decimal($payment->display_amount_micro, 2);
+    $sourceCurrency = owppgwu_currency_by_code($payment->invoice_currency);
+    $invoiceAmount = owppgwu_currency_display(
+        $payment->invoice_amount,
+        $payment->invoice_currency,
+        $sourceCurrency && isset($sourceCurrency->prefix) ? $sourceCurrency->prefix : '',
+        $sourceCurrency && isset($sourceCurrency->suffix) ? $sourceCurrency->suffix : ''
+    );
+    $computedAmount = owppgwu_micro_to_decimal($payment->computed_usdt_micro, 6);
     $baseAmount = owppgwu_micro_to_decimal($payment->base_amount_micro, 2);
-    $slot = (int) $payment->slot;
+    $amount = owppgwu_micro_to_decimal($payment->display_amount_micro, 2);
+    $slotAmount = owppgwu_micro_to_decimal(((int) $payment->slot) * OWPPGWU_CENT_MICRO, 2);
     $address = owppgwu_gateway_setting($params, 'trc20Address');
     $expiresAt = (string) $payment->expires_at;
     $supportUrl = owppgwu_gateway_setting($params, 'supportUrl');
@@ -99,15 +111,43 @@ function owppgwu_link($params)
     $id = 'owppgwu-' . (int) $params['invoiceid'];
 
     $supportHtml = $supportUrl === ''
-        ? '未精确付款时，请开工单联系客服处理。'
-        : '未精确付款时，请 <a href="' . owppgwu_html_escape($supportUrl) . '" target="_blank" rel="noopener">开工单联系客服</a> 处理。';
-    $amountHtml = owppgwu_html_escape($amount);
+        ? owppgwu_html_escape(owppgwu_t($language, 'support_plain'))
+        : '<a href="' . owppgwu_html_escape($supportUrl) . '" target="_blank" rel="noopener">'
+            . owppgwu_html_escape(owppgwu_t($language, 'support_link'))
+            . '</a>';
+
+    $labels = [
+        'title' => owppgwu_html_escape(owppgwu_t($language, 'title')),
+        'invoice_amount' => owppgwu_html_escape(owppgwu_t($language, 'invoice_amount')),
+        'rate_snapshot' => owppgwu_html_escape(owppgwu_t($language, 'rate_snapshot')),
+        'converted_amount' => owppgwu_html_escape(owppgwu_t($language, 'converted_amount')),
+        'base_amount' => owppgwu_html_escape(owppgwu_t($language, 'base_amount')),
+        'pay_amount' => owppgwu_html_escape(owppgwu_t($language, 'pay_amount')),
+        'address' => owppgwu_html_escape(owppgwu_t($language, 'address')),
+        'copy_amount' => owppgwu_html_escape(owppgwu_t($language, 'copy_amount')),
+        'copy_address' => owppgwu_html_escape(owppgwu_t($language, 'copy_address')),
+        'copied' => owppgwu_html_escape(owppgwu_t($language, 'copied')),
+    ];
+    $warning = owppgwu_t($language, 'warning', [
+        'amount' => owppgwu_html_escape($amount),
+        'support' => $supportHtml,
+    ]);
+    $note = owppgwu_html_escape(owppgwu_t($language, 'note'));
+    $slotNote = owppgwu_html_escape(owppgwu_t($language, 'slot_note', ['slot' => $slotAmount]));
+    $rateNote = owppgwu_html_escape(owppgwu_t($language, 'rate_note', [
+        'source' => $payment->invoice_currency,
+        'source_rate' => $payment->source_currency_rate,
+        'usd_rate' => $payment->usd_currency_rate,
+    ]));
+
+    $invoiceAmountHtml = owppgwu_html_escape($invoiceAmount);
+    $computedAmountHtml = owppgwu_html_escape($computedAmount);
     $baseAmountHtml = owppgwu_html_escape($baseAmount);
+    $amountHtml = owppgwu_html_escape($amount);
     $addressHtml = owppgwu_html_escape($address);
-    $slotHtml = owppgwu_html_escape(sprintf('%02d', $slot));
 
     return <<<HTML
-<div id="{$id}" class="owppgwu-box">
+<div id="{$id}" class="owppgwu-box" data-copied-label="{$labels['copied']}" data-copy-amount-label="{$labels['copy_amount']}" data-copy-address-label="{$labels['copy_address']}">
     <style>
         .owppgwu-box {
             border: 1px solid #d7dde8;
@@ -116,15 +156,20 @@ function owppgwu_link($params)
             margin: 16px 0;
             background: #fff;
             color: #172033;
-            max-width: 720px;
+            max-width: 760px;
         }
         .owppgwu-title {
             font-size: 18px;
             font-weight: 700;
             margin-bottom: 12px;
         }
+        .owppgwu-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 12px;
+        }
         .owppgwu-row {
-            margin: 12px 0;
+            margin: 10px 0;
         }
         .owppgwu-label {
             font-size: 13px;
@@ -132,10 +177,14 @@ function owppgwu_link($params)
             margin-bottom: 4px;
         }
         .owppgwu-value {
-            font-size: 20px;
+            font-size: 18px;
             font-weight: 700;
             line-height: 1.4;
             word-break: break-all;
+        }
+        .owppgwu-pay {
+            font-size: 24px;
+            color: #0f766e;
         }
         .owppgwu-address {
             font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
@@ -175,24 +224,41 @@ function owppgwu_link($params)
             margin-top: 12px;
         }
     </style>
-    <div class="owppgwu-title">USDT TRC20 支付</div>
-    <div class="owppgwu-row">
-        <div class="owppgwu-label">请精确支付金额</div>
-        <div class="owppgwu-value" data-owppgwu-amount>{$amountHtml} USDT</div>
+    <div class="owppgwu-title">{$labels['title']}</div>
+    <div class="owppgwu-grid">
+        <div class="owppgwu-row">
+            <div class="owppgwu-label">{$labels['invoice_amount']}</div>
+            <div class="owppgwu-value">{$invoiceAmountHtml}</div>
+        </div>
+        <div class="owppgwu-row">
+            <div class="owppgwu-label">{$labels['converted_amount']}</div>
+            <div class="owppgwu-value">{$computedAmountHtml} USDT</div>
+        </div>
+        <div class="owppgwu-row">
+            <div class="owppgwu-label">{$labels['base_amount']}</div>
+            <div class="owppgwu-value">{$baseAmountHtml} USDT</div>
+        </div>
+        <div class="owppgwu-row">
+            <div class="owppgwu-label">{$labels['pay_amount']}</div>
+            <div class="owppgwu-value owppgwu-pay" data-owppgwu-amount>{$amountHtml} USDT</div>
+        </div>
     </div>
     <div class="owppgwu-row">
-        <div class="owppgwu-label">TRC20 收款地址</div>
+        <div class="owppgwu-label">{$labels['rate_snapshot']}</div>
+        <div class="owppgwu-note">{$rateNote}</div>
+    </div>
+    <div class="owppgwu-row">
+        <div class="owppgwu-label">{$labels['address']}</div>
         <div class="owppgwu-address" data-owppgwu-address>{$addressHtml}</div>
     </div>
     <div class="owppgwu-actions">
-        <button type="button" class="owppgwu-button" data-owppgwu-copy="amount">复制金额</button>
-        <button type="button" class="owppgwu-button" data-owppgwu-copy="address">复制地址</button>
+        <button type="button" class="owppgwu-button" data-owppgwu-copy="amount">{$labels['copy_amount']}</button>
+        <button type="button" class="owppgwu-button" data-owppgwu-copy="address">{$labels['copy_address']}</button>
     </div>
-    <div class="owppgwu-warning">
-        必须使用 TRC20 网络，并精确支付 {$amountHtml} USDT。多付、少付或未按精确金额付款不会自动入账，{$supportHtml}
-    </div>
+    <div class="owppgwu-warning">{$warning}</div>
     <div class="owppgwu-note">
-        账单原始应付金额先向上取到 0.1 USDT（本次基础金额 {$baseAmountHtml}），再分配 +0.{$slotHtml} USDT 校准尾数。当前金额 30 分钟内有效，剩余 <span data-owppgwu-countdown data-seconds="{$remainingSeconds}"></span>。
+        {$note}<span data-owppgwu-countdown data-seconds="{$remainingSeconds}"></span>
+        <br>{$slotNote}
     </div>
     <script>
     (function () {
@@ -221,9 +287,9 @@ function owppgwu_link($params)
                 var type = button.getAttribute('data-owppgwu-copy');
                 var source = root.querySelector(type === 'amount' ? '[data-owppgwu-amount]' : '[data-owppgwu-address]');
                 copy(source ? source.textContent.replace(' USDT', '').trim() : '');
-                button.textContent = '已复制';
+                button.textContent = root.getAttribute('data-copied-label');
                 setTimeout(function () {
-                    button.textContent = type === 'amount' ? '复制金额' : '复制地址';
+                    button.textContent = type === 'amount' ? root.getAttribute('data-copy-amount-label') : root.getAttribute('data-copy-address-label');
                 }, 1200);
             });
         });
@@ -236,7 +302,7 @@ function owppgwu_link($params)
             var value = Math.max(0, seconds);
             var minutes = Math.floor(value / 60);
             var rest = value % 60;
-            countdown.textContent = minutes + ' 分 ' + String(rest).padStart(2, '0') + ' 秒';
+            countdown.textContent = minutes + 'm ' + String(rest).padStart(2, '0') + 's';
             seconds -= 1;
         }
 

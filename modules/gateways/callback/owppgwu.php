@@ -18,6 +18,22 @@ function owppgwu_callback_response($statusCode, array $body)
     exit;
 }
 
+function owppgwu_callback_tx_data($txid, $fromAddress, $toAddress, $contractAddress, $amountMicro, $confirmations, array $payload, $status, $request = null)
+{
+    return [
+        'txid' => $txid,
+        'request_id' => $request ? (int) $request->id : null,
+        'invoice_id' => $request ? (int) $request->invoice_id : null,
+        'from_address' => $fromAddress,
+        'to_address' => $toAddress,
+        'contract_address' => $contractAddress,
+        'amount_micro' => $amountMicro,
+        'confirmations' => $confirmations,
+        'status' => $status,
+        'payload' => $payload,
+    ];
+}
+
 if (empty($gatewayParams['type'])) {
     owppgwu_callback_response(503, [
         'ok' => false,
@@ -91,47 +107,6 @@ try {
     ]);
 }
 
-$expectedAddress = owppgwu_gateway_setting($gatewayParams, 'trc20Address');
-$expectedContract = owppgwu_gateway_setting($gatewayParams, 'usdtContract', 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t');
-
-if (!owppgwu_same_address($toAddress, $expectedAddress)) {
-    owppgwu_store_transaction([
-        'txid' => $txid,
-        'invoice_id' => null,
-        'from_address' => $fromAddress,
-        'to_address' => $toAddress,
-        'contract_address' => $contractAddress,
-        'amount_micro' => $amountMicro,
-        'confirmations' => $confirmations,
-        'status' => 'wrong_address',
-        'payload' => $payload,
-    ]);
-    logTransaction($gatewayParams['name'], $payload, 'Wrong Address');
-    owppgwu_callback_response(202, [
-        'ok' => false,
-        'error' => 'wrong_address',
-    ]);
-}
-
-if (!owppgwu_same_address($contractAddress, $expectedContract)) {
-    owppgwu_store_transaction([
-        'txid' => $txid,
-        'invoice_id' => null,
-        'from_address' => $fromAddress,
-        'to_address' => $toAddress,
-        'contract_address' => $contractAddress,
-        'amount_micro' => $amountMicro,
-        'confirmations' => $confirmations,
-        'status' => 'wrong_contract',
-        'payload' => $payload,
-    ]);
-    logTransaction($gatewayParams['name'], $payload, 'Wrong Contract');
-    owppgwu_callback_response(202, [
-        'ok' => false,
-        'error' => 'wrong_contract',
-    ]);
-}
-
 $existingTx = owppgwu_find_transaction($txid);
 if ($existingTx && $existingTx->status === 'processed') {
     owppgwu_callback_response(200, [
@@ -140,19 +115,64 @@ if ($existingTx && $existingTx->status === 'processed') {
     ]);
 }
 
+if ($existingTx && $existingTx->status === 'processing') {
+    owppgwu_callback_response(202, [
+        'ok' => false,
+        'status' => 'duplicate_processing',
+    ]);
+}
+
+$terminalStatuses = [
+    'wrong_address',
+    'wrong_contract',
+    'unmatched',
+    'conflict',
+    'invoice_not_payable',
+    'invoice_amount_changed',
+    'request_already_claimed',
+    'duplicate_whmcs_transaction',
+    'payment_failed',
+];
+
+if ($existingTx && in_array($existingTx->status, $terminalStatuses, true)) {
+    owppgwu_callback_response(202, [
+        'ok' => false,
+        'status' => $existingTx->status,
+    ]);
+}
+
+$expectedAddress = owppgwu_gateway_setting($gatewayParams, 'trc20Address');
+$expectedContract = owppgwu_gateway_setting($gatewayParams, 'usdtContract', 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t');
+
+if ($expectedAddress === '') {
+    logTransaction($gatewayParams['name'], $payload, 'Receiving address missing');
+    owppgwu_callback_response(503, [
+        'ok' => false,
+        'error' => 'trc20_address_missing',
+    ]);
+}
+
+if (!owppgwu_same_address($toAddress, $expectedAddress)) {
+    owppgwu_store_transaction(owppgwu_callback_tx_data($txid, $fromAddress, $toAddress, $contractAddress, $amountMicro, $confirmations, $payload, 'wrong_address'));
+    logTransaction($gatewayParams['name'], $payload, 'Wrong Address');
+    owppgwu_callback_response(202, [
+        'ok' => false,
+        'status' => 'wrong_address',
+    ]);
+}
+
+if (!owppgwu_same_address($contractAddress, $expectedContract)) {
+    owppgwu_store_transaction(owppgwu_callback_tx_data($txid, $fromAddress, $toAddress, $contractAddress, $amountMicro, $confirmations, $payload, 'wrong_contract'));
+    logTransaction($gatewayParams['name'], $payload, 'Wrong Contract');
+    owppgwu_callback_response(202, [
+        'ok' => false,
+        'status' => 'wrong_contract',
+    ]);
+}
+
 $requiredConfirmations = owppgwu_gateway_int($gatewayParams, 'requiredConfirmations', 12, 0, 1000);
 if ($confirmations < $requiredConfirmations) {
-    owppgwu_store_transaction([
-        'txid' => $txid,
-        'invoice_id' => null,
-        'from_address' => $fromAddress,
-        'to_address' => $toAddress,
-        'contract_address' => $contractAddress,
-        'amount_micro' => $amountMicro,
-        'confirmations' => $confirmations,
-        'status' => 'waiting_confirmations',
-        'payload' => $payload,
-    ]);
+    owppgwu_store_transaction(owppgwu_callback_tx_data($txid, $fromAddress, $toAddress, $contractAddress, $amountMicro, $confirmations, $payload, 'waiting_confirmations'));
     logTransaction($gatewayParams['name'], $payload, 'Waiting Confirmations');
     owppgwu_callback_response(202, [
         'ok' => false,
@@ -163,54 +183,51 @@ if ($confirmations < $requiredConfirmations) {
 $matches = owppgwu_active_requests_by_amount($amountMicro);
 
 if (count($matches) !== 1) {
-    owppgwu_store_transaction([
-        'txid' => $txid,
-        'invoice_id' => null,
-        'from_address' => $fromAddress,
-        'to_address' => $toAddress,
-        'contract_address' => $contractAddress,
-        'amount_micro' => $amountMicro,
-        'confirmations' => $confirmations,
-        'status' => count($matches) === 0 ? 'unmatched' : 'conflict',
-        'payload' => $payload,
-    ]);
-    logTransaction($gatewayParams['name'], $payload, count($matches) === 0 ? 'Unmatched Amount' : 'Amount Conflict');
+    $status = count($matches) === 0 ? 'unmatched' : 'conflict';
+    owppgwu_store_transaction(owppgwu_callback_tx_data($txid, $fromAddress, $toAddress, $contractAddress, $amountMicro, $confirmations, $payload, $status));
+    logTransaction($gatewayParams['name'], $payload, $status === 'unmatched' ? 'Unmatched Amount' : 'Amount Conflict');
     owppgwu_callback_response(202, [
         'ok' => false,
-        'status' => count($matches) === 0 ? 'unmatched' : 'conflict',
+        'status' => $status,
     ]);
 }
 
 $request = $matches[0];
+$transactionData = owppgwu_callback_tx_data($txid, $fromAddress, $toAddress, $contractAddress, $amountMicro, $confirmations, $payload, 'received', $request);
+$claim = owppgwu_claim_payment($transactionData, $request);
 
-checkCbInvoiceID((int) $request->invoice_id, $gatewayParams['name']);
-checkCbTransID($txid);
+if (empty($claim['claimed'])) {
+    logTransaction($gatewayParams['name'], $payload, 'Not Credited: ' . $claim['status']);
+    owppgwu_callback_response(202, [
+        'ok' => false,
+        'status' => $claim['status'],
+    ]);
+}
 
-addInvoicePayment(
-    (int) $request->invoice_id,
-    $txid,
-    (string) $request->invoice_amount,
-    0,
-    $gatewayModuleName
-);
+$claimedRequest = $claim['request'];
 
-owppgwu_store_transaction([
-    'txid' => $txid,
-    'invoice_id' => (int) $request->invoice_id,
-    'from_address' => $fromAddress,
-    'to_address' => $toAddress,
-    'contract_address' => $contractAddress,
-    'amount_micro' => $amountMicro,
-    'confirmations' => $confirmations,
-    'status' => 'processed',
-    'payload' => $payload,
-]);
+try {
+    addInvoicePayment(
+        (int) $claimedRequest->invoice_id,
+        $txid,
+        (string) $claimedRequest->invoice_amount,
+        0,
+        $gatewayModuleName
+    );
 
-owppgwu_mark_request_paid((int) $request->id, $txid);
-logTransaction($gatewayParams['name'], $payload, 'Successful');
+    owppgwu_finalize_payment_success((int) $claimedRequest->id, $txid);
+    logTransaction($gatewayParams['name'], $payload, 'Successful');
 
-owppgwu_callback_response(200, [
-    'ok' => true,
-    'status' => 'paid',
-    'invoice_id' => (int) $request->invoice_id,
-]);
+    owppgwu_callback_response(200, [
+        'ok' => true,
+        'status' => 'paid',
+        'invoice_id' => (int) $claimedRequest->invoice_id,
+    ]);
+} catch (Exception $exception) {
+    owppgwu_finalize_payment_failure((int) $claimedRequest->id, $txid, $exception->getMessage());
+    logTransaction($gatewayParams['name'], $payload, 'Payment Failed: ' . $exception->getMessage());
+    owppgwu_callback_response(500, [
+        'ok' => false,
+        'status' => 'payment_failed',
+    ]);
+}
