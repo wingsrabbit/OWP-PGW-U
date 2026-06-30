@@ -40,14 +40,20 @@ function owppgwu_config()
             'FriendlyName' => '回调 HMAC 密钥',
             'Type' => 'password',
             'Size' => '64',
-            'Description' => '监听服务回调时使用 X-OWP-Signature: sha256=&lt;hmac&gt; 签名。',
+            'Description' => '可选 webhook 入口使用。默认模式不需要外部 watcher。',
+        ],
+        'tronscanApiKey' => [
+            'FriendlyName' => 'TronScan API Key',
+            'Type' => 'password',
+            'Size' => '64',
+            'Description' => 'WHMCS cron 轮询 TronScan API 时发送 TRON-PRO-API-KEY header。',
         ],
         'requiredConfirmations' => [
             'FriendlyName' => '最低确认数',
             'Type' => 'text',
             'Size' => '8',
             'Default' => '12',
-            'Description' => '回调 payload 的 confirmations 必须大于或等于此值。',
+            'Description' => 'TronScan 最新区块高度减 transfer block 必须大于或等于此值。',
         ],
         'invoiceWindowMinutes' => [
             'FriendlyName' => '账单有效分钟',
@@ -55,6 +61,20 @@ function owppgwu_config()
             'Size' => '8',
             'Default' => '30',
             'Description' => '默认 30 分钟。过期后客户刷新账单页重新分配尾数金额。',
+        ],
+        'scanIntervalMinutes' => [
+            'FriendlyName' => 'TronScan 扫描间隔分钟',
+            'Type' => 'text',
+            'Size' => '8',
+            'Default' => '5',
+            'Description' => 'WHMCS cron 每次运行时，至少间隔这些分钟才会轮询 TronScan。',
+        ],
+        'scanOverlapMinutes' => [
+            'FriendlyName' => 'TronScan 扫描重叠分钟',
+            'Type' => 'text',
+            'Size' => '8',
+            'Default' => '30',
+            'Description' => '每次扫描从上次扫描时间往前重叠这些分钟，避免漏扫。',
         ],
         'calibrationSlots' => [
             'FriendlyName' => '0.01 校准槽位',
@@ -78,7 +98,7 @@ function owppgwu_link($params)
 
     try {
         owppgwu_ensure_schema();
-        $payment = owppgwu_get_or_create_payment_request((int) $params['invoiceid'], $params);
+        $payment = owppgwu_get_or_create_payment_intent((int) $params['invoiceid'], $params);
     } catch (Exception $exception) {
         return '<div class="alert alert-danger">'
             . owppgwu_html_escape(owppgwu_t($language, 'payment_unavailable', [
@@ -95,14 +115,14 @@ function owppgwu_link($params)
 
     $sourceCurrency = owppgwu_currency_by_code($payment->invoice_currency);
     $invoiceAmount = owppgwu_currency_display(
-        $payment->invoice_amount,
+        $payment->invoice_balance_snapshot,
         $payment->invoice_currency,
         $sourceCurrency && isset($sourceCurrency->prefix) ? $sourceCurrency->prefix : '',
         $sourceCurrency && isset($sourceCurrency->suffix) ? $sourceCurrency->suffix : ''
     );
-    $computedAmount = owppgwu_micro_to_decimal($payment->computed_usdt_micro, 6);
-    $baseAmount = owppgwu_micro_to_decimal($payment->base_amount_micro, 2);
-    $amount = owppgwu_micro_to_decimal($payment->display_amount_micro, 2);
+    $computedAmount = owppgwu_micro_to_decimal($payment->computed_usdt_micro_amount, 6);
+    $baseAmount = owppgwu_micro_to_decimal($payment->base_usdt_micro_amount, 2);
+    $amount = owppgwu_micro_to_decimal($payment->expected_usdt_micro_amount, 2);
     $slotAmount = owppgwu_micro_to_decimal(((int) $payment->slot) * OWPPGWU_CENT_MICRO, 2);
     $address = owppgwu_gateway_setting($params, 'trc20Address');
     $expiresAt = (string) $payment->expires_at;

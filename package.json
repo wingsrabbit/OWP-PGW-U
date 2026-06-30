@@ -1,6 +1,6 @@
 {
   "name": "owp-pgw-u",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "WHMCS USDT TRC20 payment gateway test harness",
   "scripts": {

@@ -1,6 +1,6 @@
 # Callback Payload
 
-OWP-PGW-U expects a separate blockchain watcher service to call the WHMCS callback endpoint after it detects an incoming USDT TRC20 transfer to the configured receiving address.
+OWP-PGW-U defaults to WHMCS cron polling TronScan API. This callback endpoint is optional and is intended for manual testing or emergency compensation only.
 
 ```text
 POST https://example.com/modules/gateways/callback/owppgwu.php
@@ -64,7 +64,7 @@ The callback also accepts these aliases:
 | `202` | `wrong_contract` | The contract is not the configured USDT TRC20 contract. |
 | `202` | `invoice_not_payable` | The invoice is no longer `Unpaid` or cannot be auto-credited. |
 | `202` | `invoice_amount_changed` | The invoice currency or balance no longer matches the payment request snapshot. |
-| `202` | `request_already_claimed` | Another callback already claimed the pending request. |
+| `202` | `request_already_claimed` | Another scan or callback already claimed the pending intent. |
 | `202` | `duplicate_processing` | The same txid is already being processed. |
 | `202` | `duplicate_whmcs_transaction` | WHMCS already has this transaction id. |
 | `400` | `invalid_json`, `invalid_txid`, `invalid_amount` | The payload is malformed. |
@@ -73,15 +73,16 @@ The callback also accepts these aliases:
 
 Successful callbacks credit the WHMCS invoice balance in the original invoice currency. They do not credit the paid USDT amount directly.
 
-## Watcher responsibilities
+## Default Mode
 
-The watcher service must:
+The default production mode does not need an external watcher. Configure the WHMCS gateway with:
 
-- Scan TRON for real USDT TRC20 `Transfer` events.
-- Confirm the token contract before calling WHMCS.
-- Send the human USDT amount with up to 6 decimals.
-- Retry callbacks after the configured confirmation threshold is reached.
-- Never include private keys, exchange secrets, or production API credentials in callback payloads.
+- TRC20 receiving address.
+- USDT TRC20 contract address.
+- TronScan API Key.
+- WHMCS cron.
+
+The optional callback still reuses the same intent and transaction claim logic.
 
 ## Example signer
 

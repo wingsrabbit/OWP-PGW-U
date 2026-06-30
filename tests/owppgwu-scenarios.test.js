@@ -3,6 +3,8 @@ const assert = require('node:assert/strict');
 const MICRO = 1_000_000n;
 const TENTH = 100_000n;
 const CENT = 10_000n;
+const USDT_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
+const RECEIVER = 'T_RECEIVER';
 
 function decimalToMicro(value, ceilExtra = false) {
   const text = String(value).replace(/,/g, '').trim();
@@ -61,7 +63,7 @@ class GatewayModel {
       USD: { code: 'USD', rate: '1.000000' },
     };
     this.invoices = new Map();
-    this.requests = [];
+    this.intents = [];
     this.transactions = new Map();
     this.credits = [];
   }
@@ -71,15 +73,15 @@ class GatewayModel {
   }
 
   expireStale() {
-    for (const request of this.requests) {
-      if (request.status === 'pending' && request.expiresAt < this.now) {
-        request.status = 'expired';
-        request.activeAmountKey = null;
+    for (const intent of this.intents) {
+      if (intent.status === 'pending' && !intent.txid && intent.expiresAt < this.now) {
+        intent.status = 'expired';
+        intent.activeAmountKey = null;
       }
     }
   }
 
-  createRequest(invoiceId) {
+  createIntent(invoiceId) {
     this.expireStale();
     const invoice = this.invoices.get(invoiceId);
     if (!invoice || invoice.status !== 'Unpaid') throw new Error('invoice_not_payable');
@@ -89,95 +91,112 @@ class GatewayModel {
     if (!usd) throw new Error('usd_currency_missing');
     if (decimalToMicro(source.rate, true) <= 0n) throw new Error('source_currency_rate_invalid');
     if (decimalToMicro(usd.rate, true) <= 0n) throw new Error('usd_currency_rate_invalid');
+
     const computed = convertToUsdMicro(invoice.balance, source.rate, usd.rate);
     const base = ceilToStep(computed, TENTH);
 
     for (let slot = 1; slot <= 9; slot += 1) {
-      const display = base + BigInt(slot) * CENT;
-      if (this.requests.some((request) => request.activeAmountKey === String(display))) continue;
-      const request = {
-        id: this.requests.length + 1,
+      const expected = base + BigInt(slot) * CENT;
+      if (this.intents.some((intent) => intent.activeAmountKey === String(expected))) continue;
+      const intent = {
+        id: this.intents.length + 1,
         invoiceId,
         invoiceCurrency: invoice.currency,
-        invoiceAmount: invoice.balance,
-        sourceRate: source.rate,
-        usdRate: usd.rate,
-        computed,
+        invoiceBalanceSnapshot: invoice.balance,
+        expectedMicro: expected,
+        expectedAmount: microToDecimal(expected, 6),
         base,
-        display,
+        computed,
         slot,
         status: 'pending',
         txid: null,
-        activeAmountKey: String(display),
+        activeAmountKey: String(expected),
         expiresAt: this.now + 30 * 60,
       };
-      this.requests.push(request);
-      return request;
+      this.intents.push(intent);
+      return intent;
     }
 
     return null;
   }
 
-  callback(payload) {
-    const tx = this.transactions.get(payload.txid);
+  processTransfer(row, latestBlock) {
+    const tx = this.transactions.get(row.txid);
     if (tx && tx.status === 'processed') return 'duplicate_processed';
     if (tx && tx.status === 'processing') return 'duplicate_processing';
     const terminal = new Set([
       'wrong_address',
       'wrong_contract',
+      'invalid_transfer_event',
+      'failed_contract_result',
+      'reverted_transfer',
       'unmatched',
-      'conflict',
       'invoice_not_payable',
       'invoice_amount_changed',
       'request_already_claimed',
     ]);
     if (tx && terminal.has(tx.status)) return tx.status;
 
-    if (payload.to !== 'T_RECEIVER') return this.store(payload.txid, 'wrong_address');
-    if (payload.contract !== 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t') return this.store(payload.txid, 'wrong_contract');
-    if (payload.confirmations < 12) return this.store(payload.txid, 'waiting_confirmations');
+    if (row.to !== RECEIVER) return this.store(row.txid, 'wrong_address');
+    if (row.trc20Id !== USDT_CONTRACT) return this.store(row.txid, 'wrong_contract');
+    if (row.event_type !== 'Transfer') return this.store(row.txid, 'invalid_transfer_event');
+    if (row.contract_ret !== 'SUCCESS') return this.store(row.txid, 'failed_contract_result');
+    if (!(row.revert === 0 || row.revert === '0' || row.revert === false)) return this.store(row.txid, 'reverted_transfer');
 
-    const amount = decimalToMicro(payload.amount);
+    const confirmations = latestBlock && row.block ? latestBlock - row.block : null;
+    if (confirmations === null || confirmations < 0) return this.store(row.txid, 'confirmations_unavailable');
+    if (confirmations < 12) return this.store(row.txid, 'waiting_confirmations');
+
+    const rawAmount = BigInt(row.quant);
     this.expireStale();
-    const matches = this.requests.filter((request) => request.status === 'pending' && request.display === amount && request.expiresAt >= this.now);
-    if (matches.length !== 1) return this.store(payload.txid, matches.length === 0 ? 'unmatched' : 'conflict');
+    const matches = this.intents.filter((intent) => intent.status === 'pending' && !intent.txid && intent.expectedMicro === rawAmount && intent.expiresAt >= this.now);
+    if (matches.length !== 1) return this.store(row.txid, matches.length === 0 ? 'unmatched' : 'conflict');
 
-    const request = matches[0];
-    const invoice = this.invoices.get(request.invoiceId);
-    if (!invoice || invoice.status !== 'Unpaid') return this.store(payload.txid, 'invoice_not_payable');
-    if (invoice.currency !== request.invoiceCurrency || invoice.balance !== request.invoiceAmount) {
-      return this.store(payload.txid, 'invoice_amount_changed');
+    const intent = matches[0];
+    const invoice = this.invoices.get(intent.invoiceId);
+    if (!invoice || invoice.status !== 'Unpaid') return this.store(row.txid, 'invoice_not_payable');
+    if (invoice.currency !== intent.invoiceCurrency || invoice.balance !== intent.invoiceBalanceSnapshot) {
+      return this.store(row.txid, 'invoice_amount_changed');
     }
 
-    if (request.status !== 'pending' || request.txid) return this.store(payload.txid, 'request_already_claimed');
-    request.status = 'processing';
-    request.txid = payload.txid;
-    request.activeAmountKey = null;
-    this.transactions.set(payload.txid, { status: 'processing' });
+    if (this.transactions.has(row.txid)) return this.transactions.get(row.txid).status;
+    this.transactions.set(row.txid, { status: 'processing' });
+    intent.txid = row.txid;
+    intent.activeAmountKey = null;
 
-    this.credits.push({ invoiceId: request.invoiceId, amount: request.invoiceAmount, txid: payload.txid });
-    request.status = 'paid';
-    this.transactions.set(payload.txid, { status: 'processed' });
+    this.credits.push({ invoiceId: intent.invoiceId, amount: intent.invoiceBalanceSnapshot, txid: row.txid });
+    intent.status = 'paid';
     invoice.status = 'Paid';
+    this.transactions.set(row.txid, { status: 'processed' });
     return 'paid';
+  }
+
+  scanTronScan(response, latestBlock) {
+    const rows = response.token_transfers || response.data || [];
+    return rows.map((row) => this.processTransfer(row, latestBlock));
   }
 
   store(txid, status) {
     const existing = this.transactions.get(txid);
-    if (!existing || ['received', 'waiting_confirmations'].includes(existing.status)) {
+    if (!existing || ['received', 'waiting_confirmations', 'confirmations_unavailable'].includes(existing.status)) {
       this.transactions.set(txid, { status });
     }
     return this.transactions.get(txid).status;
   }
 }
 
-function validPayload(overrides = {}) {
+function transfer(overrides = {}) {
   return {
     txid: overrides.txid || 'a'.repeat(64),
-    to: overrides.to || 'T_RECEIVER',
-    contract: overrides.contract || 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t',
-    amount: overrides.amount || '12.91',
-    confirmations: overrides.confirmations ?? 12,
+    from: overrides.from || 'T_SENDER',
+    to: overrides.to || RECEIVER,
+    trc20Id: overrides.trc20Id || USDT_CONTRACT,
+    event_type: overrides.event_type || 'Transfer',
+    contract_ret: overrides.contract_ret || 'SUCCESS',
+    revert: overrides.revert ?? 0,
+    quant: overrides.quant || '12910000',
+    block: overrides.block ?? 88,
+    block_ts: overrides.block_ts ?? 1700000000000,
   };
 }
 
@@ -192,46 +211,46 @@ function validPayload(overrides = {}) {
   const model = new GatewayModel();
   model.invoice(1, '100.00');
   delete model.currencies.USD;
-  assert.throws(() => model.createRequest(1), /usd_currency_missing/);
+  assert.throws(() => model.createIntent(1), /usd_currency_missing/);
   model.currencies.USD = { code: 'USD', rate: '0' };
-  assert.throws(() => model.createRequest(1), /usd_currency_rate_invalid/);
+  assert.throws(() => model.createIntent(1), /usd_currency_rate_invalid/);
 }
 
 {
   const model = new GatewayModel();
   for (let invoiceId = 1; invoiceId <= 9; invoiceId += 1) {
     model.invoice(invoiceId, '100.00');
-    const request = model.createRequest(invoiceId);
-    assert.equal(microToDecimal(request.display, 2), `12.9${invoiceId}`);
+    const intent = model.createIntent(invoiceId);
+    assert.equal(microToDecimal(intent.expectedMicro, 2), `12.9${invoiceId}`);
   }
   model.invoice(10, '100.00');
-  assert.equal(model.createRequest(10), null);
+  assert.equal(model.createIntent(10), null);
 }
 
 {
   const model = new GatewayModel();
   model.invoice(1, '100.00');
-  assert.equal(microToDecimal(model.createRequest(1).display, 2), '12.91');
+  assert.equal(microToDecimal(model.createIntent(1).expectedMicro, 2), '12.91');
   model.now += 31 * 60;
   model.invoice(2, '100.00');
-  assert.equal(microToDecimal(model.createRequest(2).display, 2), '12.91');
+  assert.equal(microToDecimal(model.createIntent(2).expectedMicro, 2), '12.91');
 }
 
 {
   const model = new GatewayModel();
   model.invoice(1, '100.00');
-  model.createRequest(1);
-  assert.equal(model.callback(validPayload({ to: 'T_WRONG' })), 'wrong_address');
-  assert.equal(model.callback(validPayload({ txid: 'b'.repeat(64), contract: 'T_FAKE' })), 'wrong_contract');
-  assert.equal(model.callback(validPayload({ txid: 'c'.repeat(64), confirmations: 1 })), 'waiting_confirmations');
+  model.createIntent(1);
+  assert.equal(model.processTransfer(transfer({ to: 'T_WRONG' }), 100), 'wrong_address');
+  assert.equal(model.processTransfer(transfer({ txid: 'b'.repeat(64), trc20Id: 'T_FAKE' }), 100), 'wrong_contract');
+  assert.equal(model.processTransfer(transfer({ txid: 'c'.repeat(64), block: 95 }), 100), 'waiting_confirmations');
 }
 
 {
   const model = new GatewayModel();
   model.invoice(1, '100.00');
-  model.createRequest(1);
-  assert.equal(model.callback(validPayload()), 'paid');
-  assert.equal(model.callback(validPayload()), 'duplicate_processed');
+  model.createIntent(1);
+  assert.equal(model.scanTronScan({ token_transfers: [transfer()] }, 100)[0], 'paid');
+  assert.equal(model.processTransfer(transfer(), 100), 'duplicate_processed');
   assert.equal(model.credits.length, 1);
   assert.deepEqual(model.credits[0], { invoiceId: 1, amount: '100.00', txid: 'a'.repeat(64) });
 }
@@ -239,36 +258,46 @@ function validPayload(overrides = {}) {
 {
   const model = new GatewayModel();
   model.invoice(1, '100.00');
-  model.createRequest(1);
+  model.createIntent(1);
   model.invoices.get(1).status = 'Paid';
-  assert.equal(model.callback(validPayload()), 'invoice_not_payable');
+  assert.equal(model.processTransfer(transfer(), 100), 'invoice_not_payable');
   assert.equal(model.credits.length, 0);
 }
 
 {
   const model = new GatewayModel();
   model.invoice(1, '100.00');
-  model.createRequest(1);
+  model.createIntent(1);
   model.invoices.get(1).status = 'Cancelled';
-  assert.equal(model.callback(validPayload()), 'invoice_not_payable');
+  assert.equal(model.processTransfer(transfer(), 100), 'invoice_not_payable');
   assert.equal(model.credits.length, 0);
 }
 
 {
   const model = new GatewayModel();
   model.invoice(1, '100.00');
-  model.createRequest(1);
+  model.createIntent(1);
   model.invoices.get(1).balance = '90.00';
-  assert.equal(model.callback(validPayload()), 'invoice_amount_changed');
+  assert.equal(model.processTransfer(transfer(), 100), 'invoice_amount_changed');
   assert.equal(model.credits.length, 0);
 }
 
 {
   const model = new GatewayModel();
   model.invoice(1, '100.00');
-  model.createRequest(1);
-  assert.equal(model.callback(validPayload({ txid: 'd'.repeat(64) })), 'paid');
-  assert.equal(model.callback(validPayload({ txid: 'e'.repeat(64) })), 'unmatched');
+  model.createIntent(1);
+  model.now += 31 * 60;
+  assert.equal(model.processTransfer(transfer(), 100), 'unmatched');
+  assert.equal(model.intents[0].status, 'expired');
+  assert.equal(model.credits.length, 0);
+}
+
+{
+  const model = new GatewayModel();
+  model.invoice(1, '100.00');
+  model.createIntent(1);
+  assert.equal(model.processTransfer(transfer({ txid: 'd'.repeat(64) }), 100), 'paid');
+  assert.equal(model.processTransfer(transfer({ txid: 'e'.repeat(64) }), 100), 'unmatched');
   assert.equal(model.credits.length, 1);
 }
 

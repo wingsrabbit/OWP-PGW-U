@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.0
+
+- Added WHMCS `AfterCronJob` hook for built-in TronScan API polling.
+- Added `tronscanApiKey`, `scanIntervalMinutes`, and `scanOverlapMinutes` gateway settings.
+- Added `mod_owppgwu_payment_intents`, `mod_owppgwu_processed_transactions`, and `mod_owppgwu_scan_state` tables.
+- Added latest-block confirmation calculation from TronScan block data.
+- Changed default operating model from external watcher/webhook to WHMCS cron + TronScan API polling.
+- Kept webhook callback as an optional signed fallback path.
+- Updated tests to mock TronScan transfer responses and cron auto-credit behavior.
+
 ## v0.2.0
 
 - Added WHMCS `tblcurrencies` based invoice currency to USD/USDT conversion.
