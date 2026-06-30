@@ -902,12 +902,12 @@ function owppgwu_extract_transfer_rows(array $response)
 
 function owppgwu_transfer_to_micro(array $row)
 {
-    $raw = owppgwu_get_nested_value($row, ['raw_amount', 'quant', 'value']);
+    $raw = owppgwu_get_nested_value($row, ['raw_amount', 'amount', 'quant', 'value']);
     if ($raw !== null && preg_match('/^[0-9]+$/', (string) $raw)) {
         return [(int) $raw, (string) $raw];
     }
 
-    $amount = owppgwu_get_nested_value($row, ['amount', 'amount_usdt']);
+    $amount = owppgwu_get_nested_value($row, ['amount_usdt', 'human_amount']);
     if ($amount !== null) {
         $micro = owppgwu_decimal_to_micro($amount, false);
         return [$micro, (string) $micro];
@@ -926,7 +926,7 @@ function owppgwu_normalize_tronscan_transfer(array $row)
         'txid' => strtolower((string) owppgwu_get_nested_value($row, ['transaction_id', 'hash', 'txid', 'transactionHash'])),
         'from_address' => (string) owppgwu_get_nested_value($row, ['from_address', 'from', 'transferFromAddress']),
         'to_address' => (string) owppgwu_get_nested_value($row, ['to_address', 'to', 'transferToAddress']),
-        'contract_address' => (string) owppgwu_get_nested_value($row, ['trc20Id', 'contract_address', 'contract', 'tokenInfo.tokenId', 'tokenInfo.address']),
+        'contract_address' => (string) owppgwu_get_nested_value($row, ['id', 'trc20Id', 'contract_address', 'contract', 'tokenInfo.tokenId', 'tokenInfo.address']),
         'event_type' => (string) owppgwu_get_nested_value($row, ['event_type', 'eventType', 'event_name']),
         'contract_ret' => (string) owppgwu_get_nested_value($row, ['contract_ret', 'contractRet', 'contract_result']),
         'revert' => owppgwu_get_nested_value($row, ['revert', 'reverted']),
@@ -1166,16 +1166,16 @@ function owppgwu_fetch_latest_tron_block(array $params)
     return owppgwu_extract_latest_block_number($response);
 }
 
-function owppgwu_fetch_trc20_transfers(array $params, $startTimestamp, $endTimestamp)
+function owppgwu_fetch_trc20_transfers(array $params, $startTimestamp, $endTimestamp, $start = 0, $limit = 50)
 {
     return owppgwu_http_get_json(OWPPGWU_TRONSCAN_API_BASE . '/transfer/trc20', [
         'address' => owppgwu_gateway_setting($params, 'trc20Address'),
         'trc20Id' => owppgwu_gateway_setting($params, 'usdtContract', 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t'),
-        'direction' => 1,
+        'direction' => 2,
         'reverse' => 'true',
         'db_version' => 1,
-        'start' => 0,
-        'limit' => 50,
+        'start' => (int) $start,
+        'limit' => (int) $limit,
         'start_timestamp' => (int) $startTimestamp,
         'end_timestamp' => (int) $endTimestamp,
     ], owppgwu_tronscan_headers($params));
@@ -1318,23 +1318,53 @@ function owppgwu_cron_poll_tronscan()
             throw new RuntimeException('latest_block_unavailable');
         }
 
-        $response = owppgwu_fetch_trc20_transfers($params, $startTimestamp, $endTimestamp);
-        $rows = owppgwu_extract_transfer_rows($response);
+        $pageStart = 0;
+        $pageLimit = 50;
+        $pages = 0;
+        $transfersSeen = 0;
         $results = [];
+        $seenPageKeys = [];
 
-        foreach ($rows as $row) {
-            if (!is_array($row)) {
-                continue;
+        do {
+            $response = owppgwu_fetch_trc20_transfers($params, $startTimestamp, $endTimestamp, $pageStart, $pageLimit);
+            $rows = owppgwu_extract_transfer_rows($response);
+            $rowCount = count($rows);
+            $pages++;
+
+            if ($rowCount === 0) {
+                break;
             }
 
-            try {
-                $transfer = owppgwu_normalize_tronscan_transfer($row);
-                $status = owppgwu_process_observed_transfer($transfer, $params, $latestBlock, 'owppgwu');
-                $results[$transfer['txid']] = $status;
-            } catch (Exception $exception) {
-                $results['invalid:' . count($results)] = $exception->getMessage();
+            $pageIds = [];
+            foreach ($rows as $pageRow) {
+                if (is_array($pageRow)) {
+                    $pageIds[] = (string) owppgwu_get_nested_value($pageRow, ['transaction_id', 'hash', 'txid', 'transactionHash']);
+                }
             }
-        }
+            $pageKey = hash('sha256', implode('|', $pageIds));
+            if (isset($seenPageKeys[$pageKey])) {
+                break;
+            }
+            $seenPageKeys[$pageKey] = true;
+
+            foreach ($rows as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+
+                $transfersSeen++;
+
+                try {
+                    $transfer = owppgwu_normalize_tronscan_transfer($row);
+                    $status = owppgwu_process_observed_transfer($transfer, $params, $latestBlock, 'owppgwu');
+                    $results[$transfer['txid']] = $status;
+                } catch (Exception $exception) {
+                    $results['invalid:' . count($results)] = $exception->getMessage();
+                }
+            }
+
+            $pageStart += $pageLimit;
+        } while ($rowCount >= $pageLimit);
 
         owppgwu_release_scan_lock($endTimestamp, null);
         return [
@@ -1342,6 +1372,8 @@ function owppgwu_cron_poll_tronscan()
             'start_timestamp' => $startTimestamp,
             'end_timestamp' => $endTimestamp,
             'latest_block' => $latestBlock,
+            'pages' => $pages,
+            'transfers_seen' => $transfersSeen,
             'results' => $results,
         ];
     } catch (Exception $exception) {

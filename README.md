@@ -132,7 +132,7 @@ WHMCS cron 触发 AfterCronJob hook
 插件查询 TronScan /api/transfer/trc20 获取收款地址 USDT 转账
         │
         ▼
-校验 to / contract / Transfer / SUCCESS / revert=0 / 确认数 / raw amount
+分页扫描 start=0,50,100...，校验 to / contract / Transfer / SUCCESS / revert=0 / 确认数 / raw amount
         │
         ▼
 txid + intent 原子 claim
@@ -233,13 +233,15 @@ GET /transfer/trc20
 |------|----|
 | `address` | 网关配置里的 TRC20 收款地址 |
 | `trc20Id` | USDT TRC20 合约地址 |
-| `direction` | `1` |
+| `direction` | `2`，TronScan 入账方向 |
 | `reverse` | `true` |
 | `db_version` | `1` |
-| `start` | `0` |
+| `start` | 从 `0` 开始，每页递增 `50` |
 | `limit` | `50` |
 | `start_timestamp` | 上次扫描时间减 overlap |
 | `end_timestamp` | 当前时间 |
+
+插件会分页扫描同一个时间窗口，直到某页返回少于 `50` 条记录。TronScan response 中 top-level `amount` 是 raw micro-USDT，例如 `12910000` 表示 `12.910000 USDT`，插件会用该 raw amount 与 intent 的 `expected_usdt_micro_amount` 做整数匹配。
 
 请求 header：
 
@@ -262,7 +264,7 @@ TRON-PRO-API-KEY: <TronScan API Key>
 自动入账前必须全部满足：
 
 - `to` 等于配置的 TRC20 收款地址。
-- `trc20Id` / token id 等于配置的 USDT TRC20 合约。
+- `id` / `trc20Id` / token id 等于配置的 USDT TRC20 合约。
 - `event_type` 等于 `Transfer`。
 - `contract_ret` 等于 `SUCCESS`。
 - `revert` 等于 `0`。
@@ -326,7 +328,9 @@ npm run lint:php
 - `0.1` ceiling + `+0.01` 到 `+0.09` 槽位。
 - 过期 intent 释放槽位。
 - micro-USDT raw amount 精确匹配。
-- mock TronScan API 响应触发 cron 自动入账。
+- 真实 TronScan `/api/transfer/trc20` response shape 的 `amount` raw micro-USDT 解析。
+- `direction=2` 入账方向查询参数。
+- mock TronScan API 分页响应触发 cron 自动入账。
 - wrong address / wrong contract。
 - low confirmations。
 - duplicate txid。

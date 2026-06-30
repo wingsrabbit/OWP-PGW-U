@@ -7,6 +7,7 @@
 - Added `mod_owppgwu_payment_intents`, `mod_owppgwu_processed_transactions`, and `mod_owppgwu_scan_state` tables.
 - Added latest-block confirmation calculation from TronScan block data.
 - Changed default operating model from external watcher/webhook to WHMCS cron + TronScan API polling.
+- Corrected TronScan transfer polling to use incoming `direction=2`, raw micro-USDT `amount`, top-level contract `id`, and paginated scans.
 - Kept webhook callback as an optional signed fallback path.
 - Updated tests to mock TronScan transfer responses and cron auto-credit behavior.
 

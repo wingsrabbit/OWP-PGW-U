@@ -55,6 +55,57 @@ function detectGatewayConversion(paramsCurrency, invoiceCurrency) {
   }
 }
 
+function transferValue(row, keys) {
+  for (const key of keys) {
+    const parts = key.split('.');
+    let value = row;
+    let found = true;
+    for (const part of parts) {
+      if (value && Object.prototype.hasOwnProperty.call(value, part)) {
+        value = value[part];
+      } else {
+        found = false;
+        break;
+      }
+    }
+    if (found && value !== undefined && value !== null && value !== '') return value;
+  }
+  return null;
+}
+
+function normalizeTronScanTransfer(row) {
+  const rawAmount = transferValue(row, ['raw_amount', 'amount', 'quant', 'value']);
+  if (!/^[0-9]+$/.test(String(rawAmount))) throw new Error('transfer_amount_missing');
+
+  return {
+    txid: String(transferValue(row, ['transaction_id', 'hash', 'txid', 'transactionHash'])).toLowerCase(),
+    from: String(transferValue(row, ['from_address', 'from', 'transferFromAddress'])),
+    to: String(transferValue(row, ['to_address', 'to', 'transferToAddress'])),
+    contract: String(transferValue(row, ['id', 'trc20Id', 'contract_address', 'contract', 'tokenInfo.tokenId', 'tokenInfo.address'])),
+    eventType: String(transferValue(row, ['event_type', 'eventType', 'event_name'])),
+    contractRet: String(transferValue(row, ['contract_ret', 'contractRet', 'contract_result'])),
+    revert: transferValue(row, ['revert', 'reverted']),
+    amountMicro: BigInt(rawAmount),
+    block: Number(transferValue(row, ['block', 'block_number', 'blockNumber'])),
+    blockTimestamp: Number(transferValue(row, ['block_timestamp', 'block_ts', 'timestamp', 'time'])),
+    direction: Number(transferValue(row, ['direction'])),
+  };
+}
+
+function buildTransferQuery(startTimestamp, endTimestamp, start = 0, limit = 50) {
+  return {
+    address: RECEIVER,
+    trc20Id: USDT_CONTRACT,
+    direction: 2,
+    reverse: 'true',
+    db_version: 1,
+    start,
+    limit,
+    start_timestamp: startTimestamp,
+    end_timestamp: endTimestamp,
+  };
+}
+
 class GatewayModel {
   constructor() {
     this.now = 1_000_000;
@@ -66,6 +117,7 @@ class GatewayModel {
     this.intents = [];
     this.transactions = new Map();
     this.credits = [];
+    this.scanQueries = [];
   }
 
   invoice(id, amount, currency = 'HKD', status = 'Unpaid') {
@@ -120,7 +172,8 @@ class GatewayModel {
     return null;
   }
 
-  processTransfer(row, latestBlock) {
+  processTransfer(rawRow, latestBlock) {
+    const row = normalizeTronScanTransfer(rawRow);
     const tx = this.transactions.get(row.txid);
     if (tx && tx.status === 'processed') return 'duplicate_processed';
     if (tx && tx.status === 'processing') return 'duplicate_processing';
@@ -138,18 +191,17 @@ class GatewayModel {
     if (tx && terminal.has(tx.status)) return tx.status;
 
     if (row.to !== RECEIVER) return this.store(row.txid, 'wrong_address');
-    if (row.trc20Id !== USDT_CONTRACT) return this.store(row.txid, 'wrong_contract');
-    if (row.event_type !== 'Transfer') return this.store(row.txid, 'invalid_transfer_event');
-    if (row.contract_ret !== 'SUCCESS') return this.store(row.txid, 'failed_contract_result');
+    if (row.contract !== USDT_CONTRACT) return this.store(row.txid, 'wrong_contract');
+    if (row.eventType !== 'Transfer') return this.store(row.txid, 'invalid_transfer_event');
+    if (row.contractRet !== 'SUCCESS') return this.store(row.txid, 'failed_contract_result');
     if (!(row.revert === 0 || row.revert === '0' || row.revert === false)) return this.store(row.txid, 'reverted_transfer');
 
     const confirmations = latestBlock && row.block ? latestBlock - row.block : null;
     if (confirmations === null || confirmations < 0) return this.store(row.txid, 'confirmations_unavailable');
     if (confirmations < 12) return this.store(row.txid, 'waiting_confirmations');
 
-    const rawAmount = BigInt(row.quant);
     this.expireStale();
-    const matches = this.intents.filter((intent) => intent.status === 'pending' && !intent.txid && intent.expectedMicro === rawAmount && intent.expiresAt >= this.now);
+    const matches = this.intents.filter((intent) => intent.status === 'pending' && !intent.txid && intent.expectedMicro === row.amountMicro && intent.expiresAt >= this.now);
     if (matches.length !== 1) return this.store(row.txid, matches.length === 0 ? 'unmatched' : 'conflict');
 
     const intent = matches[0];
@@ -176,6 +228,20 @@ class GatewayModel {
     return rows.map((row) => this.processTransfer(row, latestBlock));
   }
 
+  scanTronScanPages(fetchPage, latestBlock, startTimestamp, endTimestamp) {
+    const statuses = [];
+    const limit = 50;
+    for (let start = 0; ; start += limit) {
+      const query = buildTransferQuery(startTimestamp, endTimestamp, start, limit);
+      this.scanQueries.push(query);
+      const response = fetchPage(query);
+      const rows = response.token_transfers || response.data || [];
+      for (const row of rows) statuses.push(this.processTransfer(row, latestBlock));
+      if (rows.length < limit) break;
+    }
+    return statuses;
+  }
+
   store(txid, status) {
     const existing = this.transactions.get(txid);
     if (!existing || ['received', 'waiting_confirmations', 'confirmations_unavailable'].includes(existing.status)) {
@@ -187,16 +253,17 @@ class GatewayModel {
 
 function transfer(overrides = {}) {
   return {
-    txid: overrides.txid || 'a'.repeat(64),
+    hash: overrides.hash || overrides.txid || 'a'.repeat(64),
     from: overrides.from || 'T_SENDER',
     to: overrides.to || RECEIVER,
-    trc20Id: overrides.trc20Id || USDT_CONTRACT,
+    amount: overrides.amount || overrides.quant || '12910000',
+    block: overrides.block ?? 88,
+    block_timestamp: overrides.block_timestamp ?? overrides.block_ts ?? 1700000000000,
+    revert: overrides.revert ?? 0,
     event_type: overrides.event_type || 'Transfer',
     contract_ret: overrides.contract_ret || 'SUCCESS',
-    revert: overrides.revert ?? 0,
-    quant: overrides.quant || '12910000',
-    block: overrides.block ?? 88,
-    block_ts: overrides.block_ts ?? 1700000000000,
+    id: overrides.id || overrides.trc20Id || USDT_CONTRACT,
+    direction: overrides.direction ?? 2,
   };
 }
 
@@ -205,6 +272,35 @@ function transfer(overrides = {}) {
   assert.equal(microToDecimal(usd, 6), '12.820513');
   assert.equal(microToDecimal(ceilToStep(usd, TENTH), 2), '12.90');
   assert.throws(() => detectGatewayConversion('USD', 'HKD'), /gateway_convert_to_detected/);
+}
+
+{
+  const sample = transfer();
+  assert.deepEqual(Object.keys(sample), [
+    'hash',
+    'from',
+    'to',
+    'amount',
+    'block',
+    'block_timestamp',
+    'revert',
+    'event_type',
+    'contract_ret',
+    'id',
+    'direction',
+  ]);
+  const normalized = normalizeTronScanTransfer(sample);
+  assert.equal(normalized.amountMicro, 12_910_000n);
+  assert.equal(microToDecimal(normalized.amountMicro, 6), '12.910000');
+  assert.equal(normalized.contract, USDT_CONTRACT);
+  assert.equal(normalized.direction, 2);
+
+  const legacyContract = transfer({ txid: 'f'.repeat(64) });
+  delete legacyContract.id;
+  legacyContract.contract_address = USDT_CONTRACT;
+  assert.equal(normalizeTronScanTransfer(legacyContract).contract, USDT_CONTRACT);
+
+  assert.equal(buildTransferQuery(1000, 2000).direction, 2);
 }
 
 {
@@ -253,6 +349,26 @@ function transfer(overrides = {}) {
   assert.equal(model.processTransfer(transfer(), 100), 'duplicate_processed');
   assert.equal(model.credits.length, 1);
   assert.deepEqual(model.credits[0], { invoiceId: 1, amount: '100.00', txid: 'a'.repeat(64) });
+}
+
+{
+  const model = new GatewayModel();
+  model.invoice(1, '100.00');
+  model.createIntent(1);
+  const firstPage = Array.from({ length: 50 }, (_, index) => transfer({
+    txid: (index + 1).toString(16).padStart(64, '0'),
+    amount: '1',
+  }));
+  const secondPage = [transfer()];
+  const statuses = model.scanTronScanPages((query) => {
+    if (query.start === 0) return { token_transfers: firstPage };
+    if (query.start === 50) return { token_transfers: secondPage };
+    return { token_transfers: [] };
+  }, 100, 1000, 2000);
+  assert.equal(statuses.at(-1), 'paid');
+  assert.deepEqual(model.scanQueries.map((query) => query.start), [0, 50]);
+  assert.ok(model.scanQueries.every((query) => query.direction === 2));
+  assert.equal(model.credits.length, 1);
 }
 
 {
