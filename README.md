@@ -269,6 +269,7 @@ TRON-PRO-API-KEY: <TronScan API Key>
 - `contract_ret` 等于 `SUCCESS`。
 - `revert` 等于 `0`。
 - `raw amount` 等于 intent 的 `expected_usdt_micro_amount`。
+- transfer `to` 和合约也必须等于 intent 创建时保存的 `trc20_address` / `usdt_contract` 快照。
 - `txid` 没有处理过。
 - intent 仍为 `pending` 且未过期。
 - WHMCS 发票仍为 `Unpaid`。

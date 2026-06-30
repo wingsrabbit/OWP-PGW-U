@@ -587,23 +587,33 @@ function owppgwu_get_or_create_payment_intent($invoiceId, array $params)
     return owppgwu_create_payment_intent($invoiceId, $params, $quote);
 }
 
-function owppgwu_active_intents_by_amount($amountMicro)
+function owppgwu_active_intents_for_transfer($amountMicro, $toAddress, $contractAddress)
 {
     owppgwu_expire_stale_intents();
+
+    $toAddress = trim((string) $toAddress);
+    $contractAddress = trim((string) $contractAddress);
 
     $rows = Capsule::table(owppgwu_intents_table())
         ->where('status', 'pending')
         ->where('expected_usdt_micro_amount', (int) $amountMicro)
+        ->where('trc20_address', $toAddress)
+        ->where('usdt_contract', $contractAddress)
         ->where('expires_at', '>=', owppgwu_now())
         ->whereNull('txid')
         ->orderBy('id', 'asc')
         ->get();
 
     if ($rows instanceof \Illuminate\Support\Collection) {
-        return $rows->all();
+        $rows = $rows->all();
+    } elseif (!is_array($rows)) {
+        $rows = iterator_to_array($rows);
     }
 
-    return is_array($rows) ? $rows : iterator_to_array($rows);
+    return array_values(array_filter($rows, function ($intent) use ($toAddress, $contractAddress) {
+        return owppgwu_same_address($intent->trc20_address, $toAddress)
+            && owppgwu_same_address($intent->usdt_contract, $contractAddress);
+    }));
 }
 
 function owppgwu_find_processed_transaction($txid)
@@ -1049,7 +1059,11 @@ function owppgwu_process_observed_transfer(array $transfer, array $params, $late
         return 'waiting_confirmations';
     }
 
-    $matches = owppgwu_active_intents_by_amount($transfer['amount_micro']);
+    $matches = owppgwu_active_intents_for_transfer(
+        $transfer['amount_micro'],
+        $transfer['to_address'],
+        $transfer['contract_address']
+    );
     if (count($matches) !== 1) {
         $status = count($matches) === 0 ? 'unmatched' : 'conflict';
         owppgwu_store_processed_transaction(owppgwu_transfer_base_data($transfer, $status));

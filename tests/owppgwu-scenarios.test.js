@@ -55,6 +55,10 @@ function detectGatewayConversion(paramsCurrency, invoiceCurrency) {
   }
 }
 
+function sameAddress(left, right) {
+  return String(left).trim() === String(right).trim();
+}
+
 function transferValue(row, keys) {
   for (const key of keys) {
     const parts = key.split('.');
@@ -159,6 +163,8 @@ class GatewayModel {
         expectedAmount: microToDecimal(expected, 6),
         base,
         computed,
+        trc20Address: RECEIVER,
+        usdtContract: USDT_CONTRACT,
         slot,
         status: 'pending',
         txid: null,
@@ -201,7 +207,12 @@ class GatewayModel {
     if (confirmations < 12) return this.store(row.txid, 'waiting_confirmations');
 
     this.expireStale();
-    const matches = this.intents.filter((intent) => intent.status === 'pending' && !intent.txid && intent.expectedMicro === row.amountMicro && intent.expiresAt >= this.now);
+    const matches = this.intents.filter((intent) => intent.status === 'pending'
+      && !intent.txid
+      && intent.expectedMicro === row.amountMicro
+      && sameAddress(intent.trc20Address, row.to)
+      && sameAddress(intent.usdtContract, row.contract)
+      && intent.expiresAt >= this.now);
     if (matches.length !== 1) return this.store(row.txid, matches.length === 0 ? 'unmatched' : 'conflict');
 
     const intent = matches[0];
@@ -349,6 +360,35 @@ function transfer(overrides = {}) {
   assert.equal(model.processTransfer(transfer(), 100), 'duplicate_processed');
   assert.equal(model.credits.length, 1);
   assert.deepEqual(model.credits[0], { invoiceId: 1, amount: '100.00', txid: 'a'.repeat(64) });
+}
+
+{
+  const model = new GatewayModel();
+  model.invoice(1, '100.00');
+  const intent = model.createIntent(1);
+  intent.trc20Address = 'T_OLD_RECEIVER';
+  assert.equal(model.processTransfer(transfer({ txid: '9'.repeat(64) }), 100), 'unmatched');
+  assert.equal(model.credits.length, 0);
+  assert.equal(intent.status, 'pending');
+}
+
+{
+  const model = new GatewayModel();
+  model.invoice(1, '100.00');
+  const intent = model.createIntent(1);
+  intent.usdtContract = 'T_OLD_CONTRACT';
+  assert.equal(model.processTransfer(transfer({ txid: '8'.repeat(64) }), 100), 'unmatched');
+  assert.equal(model.credits.length, 0);
+  assert.equal(intent.status, 'pending');
+}
+
+{
+  const model = new GatewayModel();
+  model.invoice(1, '100.00');
+  const intent = model.createIntent(1);
+  assert.equal(model.processTransfer(transfer({ txid: '7'.repeat(64) }), 100), 'paid');
+  assert.equal(intent.status, 'paid');
+  assert.equal(model.credits.length, 1);
 }
 
 {
